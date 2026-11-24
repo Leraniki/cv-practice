@@ -7,13 +7,15 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-def resize_longer_side(image, size):
-    """Масштабирует изображение так, чтобы большая сторона стала равна size. Возвращает изображение и масштаб."""
+def resize_keep_aspect(image, max_side):
+    """Уменьшает изображение, если его большая сторона длиннее max_side."""
     h, w = image.shape[:2]
-    scale = size / max(h, w)
-    interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC #при уменьшении INTER_AREA не дает муара
-    resized = cv2.resize(image, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=interpolation)
-    return resized, scale
+    if max(h, w) <= max_side:
+        return image
+    scale = max_side / max(h, w)
+    new_w = max(1, round(w * scale))
+    new_h = max(1, round(h * scale))
+    return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA) #INTER_AREA усредняет пиксели и не дает муара
 
 
 class FeatureExtractor(ABC):
@@ -30,20 +32,15 @@ class FeatureExtractor(ABC):
 
     @abstractmethod
     def detect_and_compute(self, image):
-        """Принять картинку, вернуть (keypoints, descriptors) в едином формате."""
+        """Принять BGR-изображение, вернуть его дескрипторы: матрицу N x D (float32), одна строка на дескриптор."""
 
     @abstractmethod
     def get_params(self):
         """вернуть словарь параметров конструктора (чтобы сохранить их в файл модели и при загрузке воссоздать точно такой же экстрактор)"""
 
-    @property
-    @abstractmethod
-    def min_side(self):
-        """Подсказать функции read_image, до какого размера можно смело сжимать JPEG прямо при чтении с диска"""
-
 
 class ClassicalExtractor(FeatureExtractor):
-    """Общая часть классических методов OpenCV: масштабирование, перевод в серый, detectAndCompute.
+    """Общая часть классических методов OpenCV: уменьшение с сохранением пропорций, перевод в серый, detectAndCompute.
     база для SIFT и ORB"""
     descriptor_size = None
 
@@ -65,19 +62,12 @@ class ClassicalExtractor(FeatureExtractor):
     def get_params(self):
         return {'image_size': self.image_size, 'nfeatures': self.nfeatures}
 
-    @property
-    def min_side(self):
-        return self.image_size
-
     def detect_and_compute(self, image):
-        resized, scale = resize_longer_side(image, self.image_size)
-        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-        keypoints, descriptors = self.detector.detectAndCompute(gray, None)
-        if descriptors is None or len(keypoints) == 0:
-            return [], np.empty((0, self.descriptor_size), dtype=np.float32)
-        #возвращаем точки в координаты исходного изображения
-        keypoints = [cv2.KeyPoint(kp.pt[0] / scale, kp.pt[1] / scale, kp.size / scale, kp.angle) for kp in keypoints]
-        return keypoints, self.postprocess(descriptors)
+        gray = cv2.cvtColor(resize_keep_aspect(image, self.image_size), cv2.COLOR_BGR2GRAY)
+        _, descriptors = self.detector.detectAndCompute(gray, None)
+        if descriptors is None: #на изображении не нашлось ни одной точки
+            return np.empty((0, self.descriptor_size), dtype=np.float32)
+        return self.postprocess(descriptors)
 
 
 class SiftExtractor(ClassicalExtractor):
@@ -106,30 +96,30 @@ class OrbExtractor(ClassicalExtractor):
         return cv2.ORB_create(nfeatures=self.nfeatures, fastThreshold=10)
 
     def postprocess(self, descriptors):
-        return np.unpackbits(descriptors, axis=1).astype(np.float32) #разворачивает каждый из 32 байтов в 8 отдельных битов, превращая матрицу (N, 32) в матрицу (N, 256) из нулей и единиц 
+        return np.unpackbits(descriptors, axis=1).astype(np.float32) #разворачивает каждый из 32 байтов в 8 отдельных битов, превращая матрицу (N, 32) в матрицу (N, 256) из нулей и единиц
 
 
 class CnnExtractorBase(FeatureExtractor):
-    """Базовый класс для нейросетевых экстракторов. Признаки с заданного сверточного слоя сети, обученной на ImageNet"""
-    default_layer = None
+    """Базовый класс для нейросетевых экстракторов. Признаки берутся с выхода слоя layer сети, обученной на ImageNet"""
     MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32) #статистика ImageNet в порядке RGB
     STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-    def __init__(self, layer=None, input_size=288):
+    def __init__(self, layer, input_size=288):
         import torch
         from torchvision.models.feature_extraction import create_feature_extractor
 
         if input_size < 32:
             raise ValueError('input_size должен быть не меньше 32')
-        self.layer = layer or self.default_layer
+        self.layer = layer
         self.input_size = input_size
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         model = self.build_model().eval()
         try:
-            self.model = create_feature_extractor(model, return_nodes={self.layer: 'features'}).to(self.device)
+            #сеть обрезается после слоя self.layer и возвращает словарь {self.layer: выход этого слоя}
+            self.model = create_feature_extractor(model, return_nodes=[self.layer]).to(self.device)
         except ValueError as e:
             raise ValueError(f'В сети {self.name} нет слоя {self.layer}') from e
-        logger.info('Сеть %s, слой %s, устройство %s', self.name, self.layer, self.device)
+        logger.info('Сеть %s, признаки берутся с выхода слоя %s, устройство %s', self.name, self.layer, self.device)
 
     @abstractmethod
     def build_model(self):
@@ -138,13 +128,9 @@ class CnnExtractorBase(FeatureExtractor):
     def get_params(self):
         return {'layer': self.layer, 'input_size': self.input_size}
 
-    @property
-    def min_side(self):
-        return self.input_size
-
     def preprocess(self, image):
-        """Меньшая сторона приводится к input_size с сохранением пропорций, BGR -> RGB,
-        значения в [0, 1], нормировка (x - mean) / std, раскладка HWC -> 1 x C x H x W."""
+        """Меньшая сторона приводится к input_size, большая умножается на тот же коэффициент,
+        BGR -> RGB, значения в [0, 1], нормировка (x - mean) / std, раскладка HWC -> 1 x C x H x W."""
         import torch
 
         h, w = image.shape[:2]
@@ -155,27 +141,28 @@ class CnnExtractorBase(FeatureExtractor):
         tensor = (rgb.astype(np.float32) / 255 - self.MEAN) / self.STD
         return torch.from_numpy(tensor.transpose(2, 0, 1).copy()).unsqueeze(0)
 
-    def detect_and_compute(self, image):
+    def get_layer_output(self, image):
+        """Прямой проход сети до слоя self.layer. Возвращает выход этого слоя: карту признаков C x h x w."""
         import torch
 
         with torch.no_grad():
-            features = self.model(self.preprocess(image).to(self.device))['features'][0].cpu().numpy()
-        c, fh, fw = features.shape
-        descriptors = features.reshape(c, fh * fw).T.astype(np.float32) #строка = вектор одной ячейки карты
-        descriptors /= np.linalg.norm(descriptors, axis=1, keepdims=True) + 1e-7 #L2: убираем зависимость от контраста
+            outputs = self.model(self.preprocess(image).to(self.device))
+        return outputs[self.layer][0].cpu().numpy() #[0]: в батче одно изображение
 
-        #ключевая точка = центр ячейки карты признаков на исходном изображении
-        h, w = image.shape[:2]
-        cell_w, cell_h = w / fw, h / fh
-        keypoints = [cv2.KeyPoint((j + 0.5) * cell_w, (i + 0.5) * cell_h, min(cell_w, cell_h))
-                     for i in range(fh) for j in range(fw)]
-        return keypoints, descriptors
+    def detect_and_compute(self, image):
+        feature_map = self.get_layer_output(image)
+        c, fh, fw = feature_map.shape
+        descriptors = feature_map.reshape(c, fh * fw).T.astype(np.float32) #строка = вектор одной ячейки карты
+        descriptors /= np.linalg.norm(descriptors, axis=1, keepdims=True) + 1e-7 #L2: убираем зависимость от контраста
+        return descriptors
 
 
 class ResNet50Extractor(CnnExtractorBase):
-    """ResNet-50, веса IMAGENET1K_V2. Слой layer4: 2048 каналов, шаг 32 пикселя."""
+    """ResNet-50, веса IMAGENET1K_V2. По умолчанию признаки с выхода слоя layer4: 2048 каналов, шаг 32 пикселя."""
     name = 'resnet50'
-    default_layer = 'layer4'
+
+    def __init__(self, layer='layer4', input_size=288):
+        super().__init__(layer, input_size)
 
     def build_model(self):
         from torchvision.models import ResNet50_Weights, resnet50
@@ -183,9 +170,11 @@ class ResNet50Extractor(CnnExtractorBase):
 
 
 class EfficientNetB0Extractor(CnnExtractorBase):
-    """EfficientNet-B0, веса IMAGENET1K_V1. Слой features.8: 1280 каналов, шаг 32 пикселя."""
+    """EfficientNet-B0, веса IMAGENET1K_V1. По умолчанию признаки с выхода слоя features.8: 1280 каналов, шаг 32 пикселя."""
     name = 'efficientnet_b0'
-    default_layer = 'features.8'
+
+    def __init__(self, layer='features.8', input_size=288):
+        super().__init__(layer, input_size)
 
     def build_model(self):
         from torchvision.models import EfficientNet_B0_Weights, efficientnet_b0

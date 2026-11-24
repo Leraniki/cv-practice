@@ -59,7 +59,7 @@ class BagOfWords:
 
     def build_vocabulary(self, descriptors):
         """Строит словарь из vocab_size визуальных слов методом K-средних по матрице дескрипторов M x D."""
-        descriptors = np.ascontiguousarray(descriptors, dtype=np.float32)
+        descriptors = np.ascontiguousarray(descriptors, dtype=np.float32) #укладываем массив сплошным блоком
         if len(descriptors) < self.vocab_size:
             raise ValueError(f'Дескрипторов ({len(descriptors)}) меньше, чем слов в словаре ({self.vocab_size})')
         if self.pca_dim and self.pca_dim < descriptors.shape[1]:
@@ -74,15 +74,17 @@ class BagOfWords:
         self.vocabulary = centers.astype(np.float32)
 
     def assign_words(self, descriptors):
-        """Номер ближайшего визуального слова для каждого дескриптора.
-        |x - c|^2 = |x|^2 - 2 x c + |c|^2, слагаемое |x|^2 на выбор слова не влияет."""
+        """Заменяет каждый дескриптор изображения номером ближайшего визуального слова (центра K-средних).
+        Вход: матрица N x D, выход: массив из N номеров от 0 до K - 1. По этим номерам compute_histogram
+        считает гистограмму. Расстояния до всех K слов считаются сразу одним матричным умножением:
+        |x - c|^2 = |x|^2 - 2 x c + |c|^2, слагаемое |x|^2 одинаково для всех слов и на выбор слова не влияет."""
         if self.vocabulary is None:
             raise RuntimeError('Словарь не построен')
         if len(descriptors) == 0:
             return np.empty(0, dtype=np.int64)
-        x = self.project(np.asarray(descriptors, dtype=np.float32))
-        distances = (self.vocabulary ** 2).sum(axis=1) - 2 * x @ self.vocabulary.T
-        return distances.argmin(axis=1)
+        x = self.project(np.asarray(descriptors, dtype=np.float32)) # дескрипторы снимка в том же пространстве, где построен словарь
+        distances = (self.vocabulary ** 2).sum(axis=1) - 2 * x @ self.vocabulary.T #c это одно визуальное слово
+        return distances.argmin(axis=1) #номер столбца с наименьшим расстоянием = номер ближайшего слова
 
     def compute_histogram(self, descriptors):
         """BoW-гистограмма: доля дескрипторов изображения, попавших в каждое слово (сумма равна 1).
@@ -105,12 +107,11 @@ class BagOfWords:
         return self.classifier.predict(histograms)
 
     def predict(self, image):
-        """Классифицирует изображение. Возвращает имя класса, гистограмму, ключевые точки и номера их слов."""
-        keypoints, descriptors = self.extractor.detect_and_compute(image)
-        words = self.assign_words(descriptors)
+        """Классифицирует изображение: дескрипторы -> BoW-гистограмма -> классификатор. Возвращает имя класса и гистограмму."""
+        descriptors = self.extractor.detect_and_compute(image)
         histogram = self.compute_histogram(descriptors)
         label = int(self.predict_histograms(histogram[None, :])[0])
-        return self.class_names[label], histogram, keypoints, words
+        return self.class_names[label], histogram
 
     def save_model(self, path):
         """Сохраняет в один файл параметры экстрактора, словарь, PCA и обученный классификатор."""

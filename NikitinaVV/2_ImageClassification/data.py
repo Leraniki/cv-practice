@@ -5,24 +5,17 @@ from collections import Counter
 
 import cv2
 import numpy as np
-from PIL import Image
 
 logger = logging.getLogger(__name__)
 
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
-REDUCED_FLAGS = ((8, cv2.IMREAD_REDUCED_COLOR_8), (4, cv2.IMREAD_REDUCED_COLOR_4), (2, cv2.IMREAD_REDUCED_COLOR_2))
 
 
-def read_image(path, min_side=None):
-    """Читает цветное изображение (BGR)."""
+def read_image(path):
+    """Читает цветное изображение (BGR) в исходном размере. np.fromfile + cv2.imdecode работают с путями на кириллице."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f'Файл не найден: {path}')
-    flags = cv2.IMREAD_COLOR
-    if min_side:
-        with Image.open(path) as header:
-            side = min(header.size)
-        flags = next((flag for factor, flag in REDUCED_FLAGS if side // factor >= min_side), flags)
-    image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), flags)
+    image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError(f'Не удалось прочитать изображение: {path}')
     return image

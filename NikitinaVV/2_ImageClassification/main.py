@@ -38,9 +38,11 @@ def cli_argument_parser():
                                                 '(по умолчанию 128 для CNN, без PCA для SIFT и ORB)')
     train.add_argument('--seed', type=int, default=42, help='зерно генератора случайных чисел')
     params = train.add_argument_group('параметры экстракторов')
-    params.add_argument('--image-size', type=int, help='SIFT, ORB: размер большей стороны изображения (640)')
+    params.add_argument('--image-size', type=int, help='SIFT, ORB: изображения с большей стороной длиннее этого '
+                                                       'размера уменьшаются с сохранением пропорций (640)')
     params.add_argument('--nfeatures', type=int, help='SIFT, ORB: максимум ключевых точек (1000)')
-    params.add_argument('--layer', help='CNN: слой, с которого берутся признаки')
+    params.add_argument('--layer', help='CNN: слой сети, выход которого берется как карта признаков '
+                                        '(layer4 для resnet50, features.8 для efficientnet_b0)')
     params.add_argument('--input-size', type=int, help='CNN: размер меньшей стороны входа сети (288)')
 
     test = modes.add_parser('test', parents=[data], help='тестирование модели')
@@ -59,8 +61,7 @@ def extract_all(extractor, paths, handle):
     """Извлекает дескрипторы каждого изображения и передает их в handle(i, descriptors)."""
     start = time.time()
     for i, path in enumerate(paths):
-        _, descriptors = extractor.detect_and_compute(read_image(path, extractor.min_side))
-        handle(i, descriptors)
+        handle(i, extractor.detect_and_compute(read_image(path)))
         if (i + 1) % LOG_EVERY == 0 or i + 1 == len(paths):
             logger.info('  обработано %d/%d изображений (%.0f с)', i + 1, len(paths), time.time() - start)
 
@@ -158,8 +159,8 @@ def run_test(args):
 def run_predict(args):
     """Класс одного изображения, его BoW-гистограмма и визуализация."""
     model = BagOfWords.load_model(args.model)
-    image = read_image(args.image, model.extractor.min_side)
-    label, histogram, keypoints, words = model.predict(image)
+    image = read_image(args.image)
+    label, histogram = model.predict(image)
     print(f'Predicted class: {label}')
 
     hist_path = joint_path = None
@@ -170,8 +171,7 @@ def run_predict(args):
         joint_path = os.path.join(args.save_dir, f'{name}_with_histogram.png')
         plot_histogram(histogram, f'BoW-гистограмма ({model.extractor.name}, K = {model.vocab_size})',
                        save_path=hist_path, show=False)
-    visualize_image_with_histogram(image, histogram, label, keypoints, words, save_path=joint_path,
-                                   show=not args.no_show)
+    visualize_image_with_histogram(image, histogram, label, save_path=joint_path, show=not args.no_show)
     if args.save_dir:
         logger.info('Графики сохранены: %s, %s', hist_path, joint_path)
 
